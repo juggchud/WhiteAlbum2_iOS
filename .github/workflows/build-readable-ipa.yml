@@ -1,1 +1,206 @@
+name: Build WA2 readable iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: Build unsigned iPhone/iPad IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out your WA2 fork
+        uses: actions/checkout@v4
+
+      - name: Apply English and Japanese readable spacing fix
+        shell: bash
+        run: |
+          git apply <<'WA2_PATCH'
+          diff --git a/script/Wa2Label.cs b/script/Wa2Label.cs
+          index ac73c97..28f1410 100644
+          --- a/script/Wa2Label.cs
+          +++ b/script/Wa2Label.cs
+          @@ -119,15 +119,49 @@ public partial class Wa2Label : Node2D
+           	private bool _memoValid;
+           	private string _memoText;
+           	private int _memoProgress, _memoSegment, _memoFontSize, _memoMaxChars, _memoLineSpacing, _memoParagraphSpacing;
+          +	private bool _memoEnglishLayout;
+           	private Color _memoColor;
+           	private bool _memoShadow;
+           	private TextParseResult _memoResult;
+           	private static readonly HashSet<char> ReportedMissing = new();
+          +	// The original WA2 renderer lays every glyph out in a square Japanese text
+          +	// cell. Use narrower advances for Latin text in every language, while keeping
+          +	// the full cell for Japanese/Chinese characters and other non-ASCII glyphs.
+          +	private static int GlyphAdvance(char ch, int size, int lineSpacing)
+          +	{
+          +		if (ch > 0x7f)
+          +			return Math.Max(1, size + lineSpacing);
+          +		float width = ch switch
+          +		{
+          +			' ' => 0.42f,
+          +			'i' or 'j' or 'l' or 'I' or '!' or '.' or ',' or ':' or ';' or '\'' or '`' or '|' => 0.34f,
+          +			'f' or 'r' or 't' or '(' or ')' or '[' or ']' or '{' or '}' => 0.46f,
+          +			'M' or 'W' or '@' or '%' or '&' => 0.90f,
+          +			_ => 0.63f
+          +		};
+          +		return Math.Max(1, Mathf.RoundToInt(size * width) + lineSpacing);
+          +	}
+          +	// Look ahead at an English word so wrapping happens before the word, rather
+          +	// than cutting it in half at the right edge of the dialogue panel.
+          +	private static int UpcomingWordWidth(string text, int start, int size, int lineSpacing)
+          +	{
+          +		int width = 0;
+          +		for (int i = start; i < text.Length; i++)
+          +		{
+          +			char ch = text[i];
+          +			if (char.IsWhiteSpace(ch) || ch is '<' or '>' or '\\' or '|')
+          +				break;
+          +			width += GlyphAdvance(ch, size, lineSpacing);
+          +		}
+          +		return width;
+          +	}
+           	public TextParseResult Update(int progress)
+           	{
+          +		bool englishLayout = Wa2EngineMain.Engine?.Lang == Wa2EngineMain.Language.EN;
+           		if (_memoValid && ReferenceEquals(_memoText, Text) && _memoProgress == progress && _memoSegment == Segment &&
+           			_memoFontSize == FontSize && _memoMaxChars == MaxChars && _memoLineSpacing == LineSpacing &&
+          -			_memoParagraphSpacing == ParagraphSpacing && _memoColor == Color && _memoShadow == Shadow)
+          +			_memoParagraphSpacing == ParagraphSpacing && _memoColor == Color && _memoShadow == Shadow &&
+          +			_memoEnglishLayout == englishLayout)
+           		{
+           			return new TextParseResult { EndPosition = _memoResult.EndPosition, ParseEnd = _memoResult.ParseEnd, WaitKey = _memoResult.WaitKey };
+           		}
+          @@ -142,6 +176,7 @@ public partial class Wa2Label : Node2D
+           		_memoParagraphSpacing = ParagraphSpacing;
+           		_memoColor = Color;
+           		_memoShadow = Shadow;
+          +		_memoEnglishLayout = englishLayout;
+           		_memoResult = new TextParseResult { EndPosition = parsed.EndPosition, ParseEnd = parsed.ParseEnd, WaitKey = parsed.WaitKey };
+           		QueueRedraw();
+           		return parsed;
+          @@ -159,6 +194,9 @@ public partial class Wa2Label : Node2D
+           		int drawX = 0;
+           		int drawY = 0;
+           		int lastDrawX = 0;
+          +		int lastGlyphAdvance = FontSize;
+          +		bool englishLayout = Wa2EngineMain.Engine?.Lang == Wa2EngineMain.Language.EN;
+          +		int maxLineWidth = (MaxChars - 1) * (FontSize + LineSpacing);
+           		TextParseResult r = new();
+           		// int drawX = 0;
+           		// int drawY = 0;
+          @@ -474,6 +512,19 @@ public partial class Wa2Label : Node2D
+           				case '~':
+           					break;
+           				default:
+          +					int glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing);
+          +					// In English, wrap according to the actual Latin advance instead
+          +					// of a fixed 28-character grid, preferably at word boundaries.
+          +					bool startsWord = Text[i] != ' ' && (i == 0 || Text[i - 1] == ' ');
+          +					int upcomingWidth = englishLayout && startsWord
+          +						? UpcomingWordWidth(Text, i, modFontSize, LineSpacing) : 0;
+          +					if (englishLayout && drawX > 0 &&
+          +						((startsWord && upcomingWidth <= maxLineWidth && drawX + upcomingWidth > maxLineWidth)
+          +						 || drawX + glyphAdvance > maxLineWidth))
+          +					{
+          +						drawY += FontSize + ParagraphSpacing;
+          +						drawX = 0;
+          +					}
+           					if (curSegment >= Segment)
+           					{
+           						curprogress += Speed / 10;
+          @@ -489,14 +540,15 @@ public partial class Wa2Label : Node2D
+           						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, 16));
+           					}
+           					lastDrawX = drawX;
+          -					if (drawX >= ((MaxChars - 1) * (FontSize + LineSpacing)))
+          +					lastGlyphAdvance = glyphAdvance;
+          +					if (!englishLayout && drawX >= maxLineWidth)
+           					{
+           						drawY += FontSize + ParagraphSpacing;
+           						drawX = 0;
+           					}
+           					else
+           					{
+          -						drawX += modFontSize + LineSpacing;
+          +						drawX += glyphAdvance;
+           					}
+           					break;
+           			}
+          @@ -509,7 +561,7 @@ public partial class Wa2Label : Node2D
+           		}
+           		else
+           		{
+          -			r.EndPosition = new Vector2(lastDrawX + FontSize, drawY - FontSize - ParagraphSpacing);
+          +			r.EndPosition = new Vector2(lastDrawX + (englishLayout ? lastGlyphAdvance : FontSize), drawY - FontSize - ParagraphSpacing);
+           
+           		}
+           
+          @@ -563,4 +615,4 @@ public partial class Wa2Label : Node2D
+           		Text = text;
+           		return Update(progress);
+           	}
+          -}
+          \ No newline at end of file
+          +}
+          WA2_PATCH
+          git diff --check
+
+      - name: Install .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Compile C# changes
+        run: |
+          dotnet build wa2.csproj --configuration Release
+
+      - name: Install Godot 4.5.1 .NET and iOS export template
+        shell: bash
+        run: |
+          base=https://github.com/godotengine/godot-builds/releases/download/4.5.1-stable
+          mkdir -p "$RUNNER_TEMP/wa2-godot" build/templates
+          curl -fL --retry 3 "$base/Godot_v4.5.1-stable_mono_macos.universal.zip" -o "$RUNNER_TEMP/godot-mono.zip"
+          unzip -q "$RUNNER_TEMP/godot-mono.zip" -d "$RUNNER_TEMP/wa2-godot"
+          GODOT_BIN=$(find "$RUNNER_TEMP/wa2-godot" -type f \( -name Godot -o -name Godot_mono \) -path '*/Contents/MacOS/*' -print -quit)
+          if [ -z "$GODOT_BIN" ]; then
+            echo 'Unable to locate the Godot .NET executable' >&2
+            exit 1
+          fi
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+          "$GODOT_BIN" --headless --version
+
+          curl -fL --retry 3 "$base/Godot_v4.5.1-stable_mono_export_templates.tpz" -o "$RUNNER_TEMP/godot-templates.tpz"
+          templates="$HOME/Library/Application Support/Godot/export_templates/4.5.1.stable.mono"
+          mkdir -p "$templates"
+          unzip -q -o "$RUNNER_TEMP/godot-templates.tpz" 'templates/ios.zip' 'templates/version.txt' -d "$RUNNER_TEMP/wa2-godot"
+          cp "$RUNNER_TEMP/wa2-godot/templates/ios.zip" "$templates/ios.zip"
+          cp "$RUNNER_TEMP/wa2-godot/templates/version.txt" "$templates/version.txt"
+          cp "$templates/ios.zip" build/templates/ios-mono-arm64.zip
+
+      - name: Export Xcode project and unsigned IPA
+        shell: bash
+        run: |
+          xcodebuild -version
+          mkdir -p build/ios
+          "$GODOT_BIN" --headless --path . --editor --import
+          "$GODOT_BIN" --headless --path . --export-release iOS build/ios/WA2.ipa
+          python3 tools/prepare_ios_project.py build/ios
+          xcodebuild -project build/ios/WA2.xcodeproj -scheme WA2 -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build/ios-derived \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= build -quiet
+          python3 tools/package_ipa.py \
+            build/ios-derived/Build/Products/Release-iphoneos/WA2.app \
+            build/WA2-iPhone-iPad-Readable.ipa
+
+      - name: Downloadable IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WA2-Readable-iPhone-iPad-Unsigned
+          path: build/WA2-iPhone-iPad-Readable.ipa
+          if-no-files-found: error
 
