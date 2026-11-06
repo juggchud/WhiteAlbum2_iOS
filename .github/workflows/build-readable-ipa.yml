@@ -20,7 +20,7 @@ jobs:
         run: |
           git apply <<'WA2_PATCH'
           diff --git a/script/Wa2Label.cs b/script/Wa2Label.cs
-          index ac73c97..28f1410 100644
+          index ac73c97..efefe22 100644
           --- a/script/Wa2Label.cs
           +++ b/script/Wa2Label.cs
           @@ -119,15 +119,49 @@ public partial class Wa2Label : Node2D
@@ -92,14 +92,48 @@ jobs:
            		TextParseResult r = new();
            		// int drawX = 0;
            		// int drawY = 0;
-          @@ -474,6 +512,19 @@ public partial class Wa2Label : Node2D
+          @@ -433,9 +471,29 @@ public partial class Wa2Label : Node2D
+           							curSegment++;
+           							break;
+           						case 'n':
+          -							lastDrawX = drawX;
+          -							if (drawX > 0)
+          +							// English patches often contain manual line breaks intended for
+          +							// the original fixed-width Japanese text grid. Treat these as
+          +							// spaces and let our proportional word wrapper reflow the line.
+          +							if (englishLayout)
+           							{
+          +								bool hasSpace = (i >= 2 && Text[i - 2] == ' ') ||
+          +									(i + 1 < Text.Length && Text[i + 1] == ' ');
+          +								if (drawX > 0 && !hasSpace)
+          +								{
+          +									int spaceWidth = GlyphAdvance(' ', modFontSize, LineSpacing);
+          +									int nextWordWidth = UpcomingWordWidth(Text, i + 1, modFontSize, LineSpacing);
+          +									if (nextWordWidth <= maxLineWidth && drawX + spaceWidth + nextWordWidth > maxLineWidth)
+          +									{
+          +										drawY += FontSize + ParagraphSpacing;
+          +										drawX = 0;
+          +									}
+          +									else
+          +										drawX += spaceWidth;
+          +								}
+          +							}
+          +							else if (drawX > 0)
+          +							{
+          +								lastDrawX = drawX;
+           								drawY += FontSize + ParagraphSpacing;
+           								drawX = 0;
+           							}
+          @@ -474,6 +532,21 @@ public partial class Wa2Label : Node2D
            				case '~':
            					break;
            				default:
           +					int glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing);
           +					// In English, wrap according to the actual Latin advance instead
           +					// of a fixed 28-character grid, preferably at word boundaries.
-          +					bool startsWord = Text[i] != ' ' && (i == 0 || Text[i - 1] == ' ');
+          +					bool startsWord = Text[i] != ' ' &&
+          +						(i == 0 || Text[i - 1] == ' ' ||
+          +						 (i >= 2 && Text[i - 2] == '\\' && Text[i - 1] == 'n'));
           +					int upcomingWidth = englishLayout && startsWord
           +						? UpcomingWordWidth(Text, i, modFontSize, LineSpacing) : 0;
           +					if (englishLayout && drawX > 0 &&
@@ -112,7 +146,7 @@ jobs:
            					if (curSegment >= Segment)
            					{
            						curprogress += Speed / 10;
-          @@ -489,14 +540,15 @@ public partial class Wa2Label : Node2D
+          @@ -489,14 +562,15 @@ public partial class Wa2Label : Node2D
            						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, 16));
            					}
            					lastDrawX = drawX;
@@ -130,7 +164,7 @@ jobs:
            					}
            					break;
            			}
-          @@ -509,7 +561,7 @@ public partial class Wa2Label : Node2D
+          @@ -509,7 +583,7 @@ public partial class Wa2Label : Node2D
            		}
            		else
            		{
@@ -139,7 +173,7 @@ jobs:
            
            		}
            
-          @@ -563,4 +615,4 @@ public partial class Wa2Label : Node2D
+          @@ -563,4 +637,4 @@ public partial class Wa2Label : Node2D
            		Text = text;
            		return Update(progress);
            	}
@@ -203,4 +237,5 @@ jobs:
           name: WA2-Readable-iPhone-iPad-Unsigned
           path: build/WA2-iPhone-iPad-Readable.ipa
           if-no-files-found: error
+
 
