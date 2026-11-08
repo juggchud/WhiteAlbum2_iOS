@@ -233,8 +233,21 @@ jobs:
         shell: bash
         run: |
           base=https://github.com/godotengine/godot-builds/releases/download/4.5.1-stable
+          # The official mirror avoids intermittent GitHub release CDN 504s.
+          get_godot_asset() {
+            local official_url="$1" github_url="$2" destination="$3"
+            if ! curl -fL --retry 6 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+                "$official_url" -o "$destination"; then
+              echo 'Official Godot mirror failed; trying GitHub release CDN.' >&2
+              curl -fL --retry 6 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+                "$github_url" -o "$destination"
+            fi
+          }
           mkdir -p "$RUNNER_TEMP/wa2-godot" build/templates
-          curl -fL --retry 3 "$base/Godot_v4.5.1-stable_mono_macos.universal.zip" -o "$RUNNER_TEMP/godot-mono.zip"
+          get_godot_asset \
+            'https://downloads.godotengine.org/?flavor=stable&platform=macos.universal&slug=mono_macos.universal.zip&version=4.5.1' \
+            "$base/Godot_v4.5.1-stable_mono_macos.universal.zip" \
+            "$RUNNER_TEMP/godot-mono.zip"
           unzip -q "$RUNNER_TEMP/godot-mono.zip" -d "$RUNNER_TEMP/wa2-godot"
           GODOT_BIN=$(find "$RUNNER_TEMP/wa2-godot" -type f \( -name Godot -o -name Godot_mono \) -path '*/Contents/MacOS/*' -print -quit)
           if [ -z "$GODOT_BIN" ]; then
@@ -245,7 +258,10 @@ jobs:
           echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
           "$GODOT_BIN" --headless --version
 
-          curl -fL --retry 3 "$base/Godot_v4.5.1-stable_mono_export_templates.tpz" -o "$RUNNER_TEMP/godot-templates.tpz"
+          get_godot_asset \
+            'https://downloads.godotengine.org/?flavor=stable&platform=templates&slug=mono_export_templates.tpz&version=4.5.1' \
+            "$base/Godot_v4.5.1-stable_mono_export_templates.tpz" \
+            "$RUNNER_TEMP/godot-templates.tpz"
           templates="$HOME/Library/Application Support/Godot/export_templates/4.5.1.stable.mono"
           mkdir -p "$templates"
           unzip -q -o "$RUNNER_TEMP/godot-templates.tpz" 'templates/ios.zip' 'templates/version.txt' -d "$RUNNER_TEMP/wa2-godot"
@@ -274,4 +290,3 @@ jobs:
           name: WA2-Readable-iPhone-iPad-Unsigned
           path: build/WA2-iPhone-iPad-Readable.ipa
           if-no-files-found: error
-          
