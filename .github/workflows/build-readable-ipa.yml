@@ -15,15 +15,44 @@ jobs:
       - name: Check out your WA2 fork
         uses: actions/checkout@v4
 
-      - name: Apply English and Japanese readable spacing fix
+      - name: Apply DynaPuff rendering and natural text wrapping
         shell: bash
         run: |
           git apply <<'WA2_PATCH'
           diff --git a/script/Wa2Label.cs b/script/Wa2Label.cs
-          index ac73c97..efefe22 100644
+          index ac73c97..9ff4e06 100644
           --- a/script/Wa2Label.cs
           +++ b/script/Wa2Label.cs
-          @@ -119,15 +119,49 @@ public partial class Wa2Label : Node2D
+          @@ -16,12 +16,12 @@ public class TextTag
+           }
+           public class CharRenderData
+           {
+          -	public int X;
+          -	public int Y;
+          +	public float X;
+          +	public float Y;
+           	public int Size;
+           	public float Alpha = 1.0f;
+           	public char Chr;
+          -	public CharRenderData(char ch, int drawX, int drawY, int size, int v)
+          +	public CharRenderData(char ch, float drawX, float drawY, int size, int v)
+           	{
+           		X = drawX;
+           		Y = drawY;
+          @@ -74,8 +74,12 @@ public partial class Wa2Label : Node2D
+           	public int Segment = 0;
+           	public int ProgressStep = 0;
+           	private List<CharRenderData> _renderDatas = new();
+          +	private Font _latinFont;
+           	public override void _Ready()
+           	{
+          +		_latinFont = ResourceLoader.Load<Font>("res://assets/fonts/dynapuff/DynaPuff.ttf");
+          +		if (_latinFont == null)
+          +			GD.PushWarning("DynaPuff font unavailable; falling back to text atlas.");
+           		if (Wa2EngineMain.Engine.Lang == Wa2EngineMain.Language.JP)
+           		{
+           			
+          @@ -119,15 +123,61 @@ public partial class Wa2Label : Node2D
            	private bool _memoValid;
            	private string _memoText;
            	private int _memoProgress, _memoSegment, _memoFontSize, _memoMaxChars, _memoLineSpacing, _memoParagraphSpacing;
@@ -32,11 +61,21 @@ jobs:
            	private bool _memoShadow;
            	private TextParseResult _memoResult;
            	private static readonly HashSet<char> ReportedMissing = new();
-          +	// The original WA2 renderer lays every glyph out in a square Japanese text
-          +	// cell. Use narrower advances for Latin text in every language, while keeping
-          +	// the full cell for Japanese/Chinese characters and other non-ASCII glyphs.
-          +	private static int GlyphAdvance(char ch, int size, int lineSpacing)
+          +	private static bool UsesLatinFont(char ch) => (ch >= ' ' && ch <= '~') || ch is 'â' or 'â' or 'â' or 'â' or 'â' or 'â' or 'â¦';
+          +	// DynaPuff is a wide, round typeface. Slight scaling fits the existing line
+          +	// height and prevents clipping inside the original VN dialogue frame.
+          +	private static int LatinFontSize(int cellSize) => Math.Max(12, Mathf.RoundToInt(cellSize * 0.89f));
+          +	// Query the actual font for each successive prefix so advances preserve
+          +	// kerning, instead of using guessed fixed-width bitmap character cells.
+          +	private float GlyphAdvance(char ch, int size, int lineSpacing, string latinRun = "")
           +	{
+          +		if (_latinFont != null && UsesLatinFont(ch))
+          +		{
+          +			int pointSize = LatinFontSize(size);
+          +			float before = _latinFont.GetStringSize(latinRun, fontSize: pointSize).X;
+          +			float after = _latinFont.GetStringSize(latinRun + ch, fontSize: pointSize).X;
+          +			return Math.Max(1f, after - before + lineSpacing);
+          +		}
           +		if (ch > 0x7f)
           +			return Math.Max(1, size + lineSpacing);
           +		float width = ch switch
@@ -51,15 +90,17 @@ jobs:
           +	}
           +	// Look ahead at an English word so wrapping happens before the word, rather
           +	// than cutting it in half at the right edge of the dialogue panel.
-          +	private static int UpcomingWordWidth(string text, int start, int size, int lineSpacing)
+          +	private float UpcomingWordWidth(string text, int start, int size, int lineSpacing)
           +	{
-          +		int width = 0;
+          +		float width = 0;
+          +		string latinRun = "";
           +		for (int i = start; i < text.Length; i++)
           +		{
           +			char ch = text[i];
           +			if (char.IsWhiteSpace(ch) || ch is '<' or '>' or '\\' or '|')
           +				break;
-          +			width += GlyphAdvance(ch, size, lineSpacing);
+          +			width += GlyphAdvance(ch, size, lineSpacing, latinRun);
+          +			latinRun = UsesLatinFont(ch) ? latinRun + ch : "";
           +		}
           +		return width;
           +	}
@@ -74,7 +115,7 @@ jobs:
            		{
            			return new TextParseResult { EndPosition = _memoResult.EndPosition, ParseEnd = _memoResult.ParseEnd, WaitKey = _memoResult.WaitKey };
            		}
-          @@ -142,6 +176,7 @@ public partial class Wa2Label : Node2D
+          @@ -142,6 +192,7 @@ public partial class Wa2Label : Node2D
            		_memoParagraphSpacing = ParagraphSpacing;
            		_memoColor = Color;
            		_memoShadow = Shadow;
@@ -82,17 +123,48 @@ jobs:
            		_memoResult = new TextParseResult { EndPosition = parsed.EndPosition, ParseEnd = parsed.ParseEnd, WaitKey = parsed.WaitKey };
            		QueueRedraw();
            		return parsed;
-          @@ -159,6 +194,9 @@ public partial class Wa2Label : Node2D
-           		int drawX = 0;
+          @@ -156,9 +207,13 @@ public partial class Wa2Label : Node2D
+           		int curSegment = 0;
+           		int modFontSize = FontSize;
+           		Stack<TextTag> tagList = new();
+          -		int drawX = 0;
+          +		float drawX = 0;
            		int drawY = 0;
-           		int lastDrawX = 0;
-          +		int lastGlyphAdvance = FontSize;
+          -		int lastDrawX = 0;
+          +		float lastDrawX = 0;
+          +		float lastGlyphAdvance = FontSize;
+          +		string latinRun = "";
           +		bool englishLayout = Wa2EngineMain.Engine?.Lang == Wa2EngineMain.Language.EN;
           +		int maxLineWidth = (MaxChars - 1) * (FontSize + LineSpacing);
            		TextParseResult r = new();
            		// int drawX = 0;
            		// int drawY = 0;
-          @@ -433,9 +471,29 @@ public partial class Wa2Label : Node2D
+          @@ -259,6 +314,7 @@ public partial class Wa2Label : Node2D
+           								tag.Value = FontSize;
+           								i++;
+           								modFontSize = ParseDecimalDigits(Text, ref i);
+          +								latinRun = "";
+           								tagList.Push(tag);
+           								break;
+           							case 'K':
+          @@ -270,7 +326,7 @@ public partial class Wa2Label : Node2D
+           							case 'r':
+           								//è®°å½å½åç»å¶çä½ç½®æ¹ä¾¿ä¸æ¬¡éå°|ç¬¦å·æ¶ç»å¶æ³¨é³å­ç¬¦
+           								tag.Type = 5;
+          -								tag.Value = drawX;
+          +								tag.Value = Mathf.RoundToInt(drawX);
+           								tagList.Push(tag);
+           								break;
+           							case 'S':
+          @@ -340,6 +396,7 @@ public partial class Wa2Label : Node2D
+           								break;
+           							case 4:
+           								modFontSize = tag.Value;
+          +								latinRun = "";
+           								break;
+           							case 6:
+           								break;
+          @@ -433,11 +490,36 @@ public partial class Wa2Label : Node2D
            							curSegment++;
            							break;
            						case 'n':
@@ -102,39 +174,46 @@ jobs:
           +							// the original fixed-width Japanese text grid. Treat these as
           +							// spaces and let our proportional word wrapper reflow the line.
           +							if (englishLayout)
-           							{
+          +							{
           +								bool hasSpace = (i >= 2 && Text[i - 2] == ' ') ||
           +									(i + 1 < Text.Length && Text[i + 1] == ' ');
           +								if (drawX > 0 && !hasSpace)
           +								{
-          +									int spaceWidth = GlyphAdvance(' ', modFontSize, LineSpacing);
-          +									int nextWordWidth = UpcomingWordWidth(Text, i + 1, modFontSize, LineSpacing);
+          +									float spaceWidth = GlyphAdvance(' ', modFontSize, LineSpacing, latinRun);
+          +									float nextWordWidth = UpcomingWordWidth(Text, i + 1, modFontSize, LineSpacing);
           +									if (nextWordWidth <= maxLineWidth && drawX + spaceWidth + nextWordWidth > maxLineWidth)
           +									{
           +										drawY += FontSize + ParagraphSpacing;
           +										drawX = 0;
+          +										latinRun = "";
           +									}
           +									else
+          +									{
           +										drawX += spaceWidth;
+          +										latinRun += " ";
+          +									}
           +								}
           +							}
           +							else if (drawX > 0)
-          +							{
+           							{
           +								lastDrawX = drawX;
            								drawY += FontSize + ParagraphSpacing;
            								drawX = 0;
+          +								latinRun = "";
            							}
-          @@ -474,6 +532,21 @@ public partial class Wa2Label : Node2D
+           
+           							break;
+          @@ -474,6 +556,30 @@ public partial class Wa2Label : Node2D
            				case '~':
            					break;
            				default:
-          +					int glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing);
+          +					float glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing, latinRun);
           +					// In English, wrap according to the actual Latin advance instead
           +					// of a fixed 28-character grid, preferably at word boundaries.
           +					bool startsWord = Text[i] != ' ' &&
           +						(i == 0 || Text[i - 1] == ' ' ||
           +						 (i >= 2 && Text[i - 2] == '\\' && Text[i - 1] == 'n'));
-          +					int upcomingWidth = englishLayout && startsWord
+          +					float upcomingWidth = englishLayout && startsWord
           +						? UpcomingWordWidth(Text, i, modFontSize, LineSpacing) : 0;
           +					if (englishLayout && drawX > 0 &&
           +						((startsWord && upcomingWidth <= maxLineWidth && drawX + upcomingWidth > maxLineWidth)
@@ -142,20 +221,40 @@ jobs:
           +					{
           +						drawY += FontSize + ParagraphSpacing;
           +						drawX = 0;
+          +						latinRun = "";
+          +						glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing);
+          +					}
+          +					float glyphX = drawX;
+          +					if (_latinFont != null && UsesLatinFont(Text[i]))
+          +					{
+          +						// Shift the glyph's origin by its kerning pair adjustment.
+          +						float singleWidth = _latinFont.GetStringSize(Text[i].ToString(), fontSize: LatinFontSize(modFontSize)).X;
+          +						glyphX += glyphAdvance - singleWidth - LineSpacing;
           +					}
            					if (curSegment >= Segment)
            					{
            						curprogress += Speed / 10;
-          @@ -489,14 +562,15 @@ public partial class Wa2Label : Node2D
-           						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, 16));
+          @@ -482,21 +588,24 @@ public partial class Wa2Label : Node2D
+           						{
+           							v = progress - curprogress;
+           						}
+          -						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, v));
+          +						_renderDatas.Add(new CharRenderData(Text[i], glyphX, drawY, modFontSize, v));
+           					}
+           					else
+           					{
+          -						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, 16));
+          +						_renderDatas.Add(new CharRenderData(Text[i], glyphX, drawY, modFontSize, 16));
            					}
            					lastDrawX = drawX;
           -					if (drawX >= ((MaxChars - 1) * (FontSize + LineSpacing)))
           +					lastGlyphAdvance = glyphAdvance;
+          +					latinRun = UsesLatinFont(Text[i]) ? latinRun + Text[i] : "";
           +					if (!englishLayout && drawX >= maxLineWidth)
            					{
            						drawY += FontSize + ParagraphSpacing;
            						drawX = 0;
+          +						latinRun = "";
            					}
            					else
            					{
@@ -164,7 +263,7 @@ jobs:
            					}
            					break;
            			}
-          @@ -509,7 +583,7 @@ public partial class Wa2Label : Node2D
+          @@ -509,7 +618,7 @@ public partial class Wa2Label : Node2D
            		}
            		else
            		{
@@ -173,7 +272,30 @@ jobs:
            
            		}
            
-          @@ -563,4 +637,4 @@ public partial class Wa2Label : Node2D
+          @@ -532,6 +641,22 @@ public partial class Wa2Label : Node2D
+           	}
+           	public void DrawChar(CharRenderData r, bool shadowPass)
+           	{
+          +		if (_latinFont != null && UsesLatinFont(r.Chr))
+          +		{
+          +			// The atlas is top-aligned; Godot's font renderer uses a baseline.
+          +			// Center the new font vertically inside the original 28px cell.
+          +			int pointSize = LatinFontSize(r.Size);
+          +			float baseline = r.Y + (r.Size - _latinFont.GetHeight(pointSize)) * 0.5f + _latinFont.GetAscent(pointSize);
+          +			Vector2 origin = new(r.X, baseline);
+          +			string glyph = r.Chr.ToString();
+          +			if (shadowPass)
+          +				DrawStringOutline(_latinFont, origin, glyph, HorizontalAlignment.Left, -1, pointSize, 2,
+          +					new Color(0.08f, 0.08f, 0.08f, r.Alpha * ShadowColor.A));
+          +			else
+          +				DrawString(_latinFont, origin, glyph, HorizontalAlignment.Left, -1, pointSize,
+          +					new Color(Color.R, Color.G, Color.B, r.Alpha));
+          +			return;
+          +		}
+           		if (!Wa2Def.FontMap.TryGetValue(r.Chr, out int pos))
+           		{
+           			if (!shadowPass && ReportedMissing.Add(r.Chr))
+          @@ -563,4 +688,4 @@ public partial class Wa2Label : Node2D
            		Text = text;
            		return Update(progress);
            	}
@@ -182,6 +304,14 @@ jobs:
           +}
           WA2_PATCH
           git diff --check
+
+      - name: Bundle DynaPuff font and open-font license
+        shell: bash
+        run: |
+          mkdir -p assets/fonts/dynapuff assets/legal
+          curl --globoff -fL --retry 3 'https://raw.githubusercontent.com/google/fonts/main/ofl/dynapuff/DynaPuff%5Bwdth%2Cwght%5D.ttf' -o assets/fonts/dynapuff/DynaPuff.ttf
+          echo 'c3752fc6dd8aaa46a88637f061a9a4e6ab44c02c5f0afd65528b91ae8ff6f948  assets/fonts/dynapuff/DynaPuff.ttf' | shasum -a 256 --check
+          curl -fL --retry 3 'https://raw.githubusercontent.com/google/fonts/main/ofl/dynapuff/OFL.txt' -o assets/legal/DynaPuff-OFL.txt
 
       - name: Install .NET 9
         uses: actions/setup-dotnet@v4
@@ -237,5 +367,3 @@ jobs:
           name: WA2-Readable-iPhone-iPad-Unsigned
           path: build/WA2-iPhone-iPad-Readable.ipa
           if-no-files-found: error
-
-
