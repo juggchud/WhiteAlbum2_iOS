@@ -18,291 +18,198 @@ jobs:
       - name: Apply DynaPuff rendering and natural text wrapping
         shell: bash
         run: |
-          git apply <<'WA2_PATCH'
-          diff --git a/script/Wa2Label.cs b/script/Wa2Label.cs
-          index ac73c97..9ff4e06 100644
-          --- a/script/Wa2Label.cs
-          +++ b/script/Wa2Label.cs
-          @@ -16,12 +16,12 @@ public class TextTag
-           }
-           public class CharRenderData
-           {
-          -	public int X;
-          -	public int Y;
-          +	public float X;
-          +	public float Y;
-           	public int Size;
-           	public float Alpha = 1.0f;
-           	public char Chr;
-          -	public CharRenderData(char ch, int drawX, int drawY, int size, int v)
-          +	public CharRenderData(char ch, float drawX, float drawY, int size, int v)
-           	{
-           		X = drawX;
-           		Y = drawY;
-          @@ -74,8 +74,12 @@ public partial class Wa2Label : Node2D
-           	public int Segment = 0;
-           	public int ProgressStep = 0;
-           	private List<CharRenderData> _renderDatas = new();
-          +	private Font _latinFont;
-           	public override void _Ready()
-           	{
-          +		_latinFont = ResourceLoader.Load<Font>("res://assets/fonts/dynapuff/DynaPuff.ttf");
-          +		if (_latinFont == null)
-          +			GD.PushWarning("DynaPuff font unavailable; falling back to text atlas.");
-           		if (Wa2EngineMain.Engine.Lang == Wa2EngineMain.Language.JP)
-           		{
-           			
-          @@ -119,15 +123,61 @@ public partial class Wa2Label : Node2D
-           	private bool _memoValid;
-           	private string _memoText;
-           	private int _memoProgress, _memoSegment, _memoFontSize, _memoMaxChars, _memoLineSpacing, _memoParagraphSpacing;
-          +	private bool _memoEnglishLayout;
-           	private Color _memoColor;
-           	private bool _memoShadow;
-           	private TextParseResult _memoResult;
-           	private static readonly HashSet<char> ReportedMissing = new();
-          +	private static bool UsesLatinFont(char ch) => (ch >= ' ' && ch <= '~') || ch is 'â' or 'â' or 'â' or 'â' or 'â' or 'â' or 'â¦';
-          +	// DynaPuff is a wide, round typeface. Slight scaling fits the existing line
-          +	// height and prevents clipping inside the original VN dialogue frame.
-          +	private static int LatinFontSize(int cellSize) => Math.Max(12, Mathf.RoundToInt(cellSize * 0.89f));
-          +	// Query the actual font for each successive prefix so advances preserve
-          +	// kerning, instead of using guessed fixed-width bitmap character cells.
-          +	private float GlyphAdvance(char ch, int size, int lineSpacing, string latinRun = "")
-          +	{
-          +		if (_latinFont != null && UsesLatinFont(ch))
-          +		{
-          +			int pointSize = LatinFontSize(size);
-          +			float before = _latinFont.GetStringSize(latinRun, fontSize: pointSize).X;
-          +			float after = _latinFont.GetStringSize(latinRun + ch, fontSize: pointSize).X;
-          +			return Math.Max(1f, after - before + lineSpacing);
-          +		}
-          +		if (ch > 0x7f)
-          +			return Math.Max(1, size + lineSpacing);
-          +		float width = ch switch
-          +		{
-          +			' ' => 0.42f,
-          +			'i' or 'j' or 'l' or 'I' or '!' or '.' or ',' or ':' or ';' or '\'' or '`' or '|' => 0.34f,
-          +			'f' or 'r' or 't' or '(' or ')' or '[' or ']' or '{' or '}' => 0.46f,
-          +			'M' or 'W' or '@' or '%' or '&' => 0.90f,
-          +			_ => 0.63f
-          +		};
-          +		return Math.Max(1, Mathf.RoundToInt(size * width) + lineSpacing);
-          +	}
-          +	// Look ahead at an English word so wrapping happens before the word, rather
-          +	// than cutting it in half at the right edge of the dialogue panel.
-          +	private float UpcomingWordWidth(string text, int start, int size, int lineSpacing)
-          +	{
-          +		float width = 0;
-          +		string latinRun = "";
-          +		for (int i = start; i < text.Length; i++)
-          +		{
-          +			char ch = text[i];
-          +			if (char.IsWhiteSpace(ch) || ch is '<' or '>' or '\\' or '|')
-          +				break;
-          +			width += GlyphAdvance(ch, size, lineSpacing, latinRun);
-          +			latinRun = UsesLatinFont(ch) ? latinRun + ch : "";
-          +		}
-          +		return width;
-          +	}
-           	public TextParseResult Update(int progress)
-           	{
-          +		bool englishLayout = Wa2EngineMain.Engine?.Lang == Wa2EngineMain.Language.EN;
-           		if (_memoValid && ReferenceEquals(_memoText, Text) && _memoProgress == progress && _memoSegment == Segment &&
-           			_memoFontSize == FontSize && _memoMaxChars == MaxChars && _memoLineSpacing == LineSpacing &&
-          -			_memoParagraphSpacing == ParagraphSpacing && _memoColor == Color && _memoShadow == Shadow)
-          +			_memoParagraphSpacing == ParagraphSpacing && _memoColor == Color && _memoShadow == Shadow &&
-          +			_memoEnglishLayout == englishLayout)
-           		{
-           			return new TextParseResult { EndPosition = _memoResult.EndPosition, ParseEnd = _memoResult.ParseEnd, WaitKey = _memoResult.WaitKey };
-           		}
-          @@ -142,6 +192,7 @@ public partial class Wa2Label : Node2D
-           		_memoParagraphSpacing = ParagraphSpacing;
-           		_memoColor = Color;
-           		_memoShadow = Shadow;
-          +		_memoEnglishLayout = englishLayout;
-           		_memoResult = new TextParseResult { EndPosition = parsed.EndPosition, ParseEnd = parsed.ParseEnd, WaitKey = parsed.WaitKey };
-           		QueueRedraw();
-           		return parsed;
-          @@ -156,9 +207,13 @@ public partial class Wa2Label : Node2D
-           		int curSegment = 0;
-           		int modFontSize = FontSize;
-           		Stack<TextTag> tagList = new();
-          -		int drawX = 0;
-          +		float drawX = 0;
-           		int drawY = 0;
-          -		int lastDrawX = 0;
-          +		float lastDrawX = 0;
-          +		float lastGlyphAdvance = FontSize;
-          +		string latinRun = "";
-          +		bool englishLayout = Wa2EngineMain.Engine?.Lang == Wa2EngineMain.Language.EN;
-          +		int maxLineWidth = (MaxChars - 1) * (FontSize + LineSpacing);
-           		TextParseResult r = new();
-           		// int drawX = 0;
-           		// int drawY = 0;
-          @@ -259,6 +314,7 @@ public partial class Wa2Label : Node2D
-           								tag.Value = FontSize;
-           								i++;
-           								modFontSize = ParseDecimalDigits(Text, ref i);
-          +								latinRun = "";
-           								tagList.Push(tag);
-           								break;
-           							case 'K':
-          @@ -270,7 +326,7 @@ public partial class Wa2Label : Node2D
-           							case 'r':
-           								//è®°å½å½åç»å¶çä½ç½®æ¹ä¾¿ä¸æ¬¡éå°|ç¬¦å·æ¶ç»å¶æ³¨é³å­ç¬¦
-           								tag.Type = 5;
-          -								tag.Value = drawX;
-          +								tag.Value = Mathf.RoundToInt(drawX);
-           								tagList.Push(tag);
-           								break;
-           							case 'S':
-          @@ -340,6 +396,7 @@ public partial class Wa2Label : Node2D
-           								break;
-           							case 4:
-           								modFontSize = tag.Value;
-          +								latinRun = "";
-           								break;
-           							case 6:
-           								break;
-          @@ -433,11 +490,36 @@ public partial class Wa2Label : Node2D
-           							curSegment++;
-           							break;
-           						case 'n':
-          -							lastDrawX = drawX;
-          -							if (drawX > 0)
-          +							// English patches often contain manual line breaks intended for
-          +							// the original fixed-width Japanese text grid. Treat these as
-          +							// spaces and let our proportional word wrapper reflow the line.
-          +							if (englishLayout)
-          +							{
-          +								bool hasSpace = (i >= 2 && Text[i - 2] == ' ') ||
-          +									(i + 1 < Text.Length && Text[i + 1] == ' ');
-          +								if (drawX > 0 && !hasSpace)
-          +								{
-          +									float spaceWidth = GlyphAdvance(' ', modFontSize, LineSpacing, latinRun);
-          +									float nextWordWidth = UpcomingWordWidth(Text, i + 1, modFontSize, LineSpacing);
-          +									if (nextWordWidth <= maxLineWidth && drawX + spaceWidth + nextWordWidth > maxLineWidth)
-          +									{
-          +										drawY += FontSize + ParagraphSpacing;
-          +										drawX = 0;
-          +										latinRun = "";
-          +									}
-          +									else
-          +									{
-          +										drawX += spaceWidth;
-          +										latinRun += " ";
-          +									}
-          +								}
-          +							}
-          +							else if (drawX > 0)
-           							{
-          +								lastDrawX = drawX;
-           								drawY += FontSize + ParagraphSpacing;
-           								drawX = 0;
-          +								latinRun = "";
-           							}
-           
-           							break;
-          @@ -474,6 +556,30 @@ public partial class Wa2Label : Node2D
-           				case '~':
-           					break;
-           				default:
-          +					float glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing, latinRun);
-          +					// In English, wrap according to the actual Latin advance instead
-          +					// of a fixed 28-character grid, preferably at word boundaries.
-          +					bool startsWord = Text[i] != ' ' &&
-          +						(i == 0 || Text[i - 1] == ' ' ||
-          +						 (i >= 2 && Text[i - 2] == '\\' && Text[i - 1] == 'n'));
-          +					float upcomingWidth = englishLayout && startsWord
-          +						? UpcomingWordWidth(Text, i, modFontSize, LineSpacing) : 0;
-          +					if (englishLayout && drawX > 0 &&
-          +						((startsWord && upcomingWidth <= maxLineWidth && drawX + upcomingWidth > maxLineWidth)
-          +						 || drawX + glyphAdvance > maxLineWidth))
-          +					{
-          +						drawY += FontSize + ParagraphSpacing;
-          +						drawX = 0;
-          +						latinRun = "";
-          +						glyphAdvance = GlyphAdvance(Text[i], modFontSize, LineSpacing);
-          +					}
-          +					float glyphX = drawX;
-          +					if (_latinFont != null && UsesLatinFont(Text[i]))
-          +					{
-          +						// Shift the glyph's origin by its kerning pair adjustment.
-          +						float singleWidth = _latinFont.GetStringSize(Text[i].ToString(), fontSize: LatinFontSize(modFontSize)).X;
-          +						glyphX += glyphAdvance - singleWidth - LineSpacing;
-          +					}
-           					if (curSegment >= Segment)
-           					{
-           						curprogress += Speed / 10;
-          @@ -482,21 +588,24 @@ public partial class Wa2Label : Node2D
-           						{
-           							v = progress - curprogress;
-           						}
-          -						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, v));
-          +						_renderDatas.Add(new CharRenderData(Text[i], glyphX, drawY, modFontSize, v));
-           					}
-           					else
-           					{
-          -						_renderDatas.Add(new CharRenderData(Text[i], drawX, drawY, modFontSize, 16));
-          +						_renderDatas.Add(new CharRenderData(Text[i], glyphX, drawY, modFontSize, 16));
-           					}
-           					lastDrawX = drawX;
-          -					if (drawX >= ((MaxChars - 1) * (FontSize + LineSpacing)))
-          +					lastGlyphAdvance = glyphAdvance;
-          +					latinRun = UsesLatinFont(Text[i]) ? latinRun + Text[i] : "";
-          +					if (!englishLayout && drawX >= maxLineWidth)
-           					{
-           						drawY += FontSize + ParagraphSpacing;
-           						drawX = 0;
-          +						latinRun = "";
-           					}
-           					else
-           					{
-          -						drawX += modFontSize + LineSpacing;
-          +						drawX += glyphAdvance;
-           					}
-           					break;
-           			}
-          @@ -509,7 +618,7 @@ public partial class Wa2Label : Node2D
-           		}
-           		else
-           		{
-          -			r.EndPosition = new Vector2(lastDrawX + FontSize, drawY - FontSize - ParagraphSpacing);
-          +			r.EndPosition = new Vector2(lastDrawX + (englishLayout ? lastGlyphAdvance : FontSize), drawY - FontSize - ParagraphSpacing);
-           
-           		}
-           
-          @@ -532,6 +641,22 @@ public partial class Wa2Label : Node2D
-           	}
-           	public void DrawChar(CharRenderData r, bool shadowPass)
-           	{
-          +		if (_latinFont != null && UsesLatinFont(r.Chr))
-          +		{
-          +			// The atlas is top-aligned; Godot's font renderer uses a baseline.
-          +			// Center the new font vertically inside the original 28px cell.
-          +			int pointSize = LatinFontSize(r.Size);
-          +			float baseline = r.Y + (r.Size - _latinFont.GetHeight(pointSize)) * 0.5f + _latinFont.GetAscent(pointSize);
-          +			Vector2 origin = new(r.X, baseline);
-          +			string glyph = r.Chr.ToString();
-          +			if (shadowPass)
-          +				DrawStringOutline(_latinFont, origin, glyph, HorizontalAlignment.Left, -1, pointSize, 2,
-          +					new Color(0.08f, 0.08f, 0.08f, r.Alpha * ShadowColor.A));
-          +			else
-          +				DrawString(_latinFont, origin, glyph, HorizontalAlignment.Left, -1, pointSize,
-          +					new Color(Color.R, Color.G, Color.B, r.Alpha));
-          +			return;
-          +		}
-           		if (!Wa2Def.FontMap.TryGetValue(r.Chr, out int pos))
-           		{
-           			if (!shadowPass && ReportedMissing.Add(r.Chr))
-          @@ -563,4 +688,4 @@ public partial class Wa2Label : Node2D
-           		Text = text;
-           		return Update(progress);
-           	}
-          -}
-          \ No newline at end of file
-          +}
-          WA2_PATCH
+          python3 -c 'import sys,base64;sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' <<'WA2_PATCH_B64' | git apply
+          ZGlmZiAtLWdpdCBhL3NjcmlwdC9XYTJMYWJlbC5jcyBiL3NjcmlwdC9XYTJMYWJlbC5jcwppbmRl
+          eCBhYzczYzk3Li45ZmY0ZTA2IDEwMDY0NAotLS0gYS9zY3JpcHQvV2EyTGFiZWwuY3MKKysrIGIv
+          c2NyaXB0L1dhMkxhYmVsLmNzCkBAIC0xNiwxMiArMTYsMTIgQEAgcHVibGljIGNsYXNzIFRleHRU
+          YWcKIH0KIHB1YmxpYyBjbGFzcyBDaGFyUmVuZGVyRGF0YQogewotCXB1YmxpYyBpbnQgWDsKLQlw
+          dWJsaWMgaW50IFk7CisJcHVibGljIGZsb2F0IFg7CisJcHVibGljIGZsb2F0IFk7CiAJcHVibGlj
+          IGludCBTaXplOwogCXB1YmxpYyBmbG9hdCBBbHBoYSA9IDEuMGY7CiAJcHVibGljIGNoYXIgQ2hy
+          OwotCXB1YmxpYyBDaGFyUmVuZGVyRGF0YShjaGFyIGNoLCBpbnQgZHJhd1gsIGludCBkcmF3WSwg
+          aW50IHNpemUsIGludCB2KQorCXB1YmxpYyBDaGFyUmVuZGVyRGF0YShjaGFyIGNoLCBmbG9hdCBk
+          cmF3WCwgZmxvYXQgZHJhd1ksIGludCBzaXplLCBpbnQgdikKIAl7CiAJCVggPSBkcmF3WDsKIAkJ
+          WSA9IGRyYXdZOwpAQCAtNzQsOCArNzQsMTIgQEAgcHVibGljIHBhcnRpYWwgY2xhc3MgV2EyTGFi
+          ZWwgOiBOb2RlMkQKIAlwdWJsaWMgaW50IFNlZ21lbnQgPSAwOwogCXB1YmxpYyBpbnQgUHJvZ3Jl
+          c3NTdGVwID0gMDsKIAlwcml2YXRlIExpc3Q8Q2hhclJlbmRlckRhdGE+IF9yZW5kZXJEYXRhcyA9
+          IG5ldygpOworCXByaXZhdGUgRm9udCBfbGF0aW5Gb250OwogCXB1YmxpYyBvdmVycmlkZSB2b2lk
+          IF9SZWFkeSgpCiAJeworCQlfbGF0aW5Gb250ID0gUmVzb3VyY2VMb2FkZXIuTG9hZDxGb250Pigi
+          cmVzOi8vYXNzZXRzL2ZvbnRzL2R5bmFwdWZmL0R5bmFQdWZmLnR0ZiIpOworCQlpZiAoX2xhdGlu
+          Rm9udCA9PSBudWxsKQorCQkJR0QuUHVzaFdhcm5pbmcoIkR5bmFQdWZmIGZvbnQgdW5hdmFpbGFi
+          bGU7IGZhbGxpbmcgYmFjayB0byB0ZXh0IGF0bGFzLiIpOwogCQlpZiAoV2EyRW5naW5lTWFpbi5F
+          bmdpbmUuTGFuZyA9PSBXYTJFbmdpbmVNYWluLkxhbmd1YWdlLkpQKQogCQl7CiAJCQkKQEAgLTEx
+          OSwxNSArMTIzLDYxIEBAIHB1YmxpYyBwYXJ0aWFsIGNsYXNzIFdhMkxhYmVsIDogTm9kZTJECiAJ
+          cHJpdmF0ZSBib29sIF9tZW1vVmFsaWQ7CiAJcHJpdmF0ZSBzdHJpbmcgX21lbW9UZXh0OwogCXBy
+          aXZhdGUgaW50IF9tZW1vUHJvZ3Jlc3MsIF9tZW1vU2VnbWVudCwgX21lbW9Gb250U2l6ZSwgX21l
+          bW9NYXhDaGFycywgX21lbW9MaW5lU3BhY2luZywgX21lbW9QYXJhZ3JhcGhTcGFjaW5nOworCXBy
+          aXZhdGUgYm9vbCBfbWVtb0VuZ2xpc2hMYXlvdXQ7CiAJcHJpdmF0ZSBDb2xvciBfbWVtb0NvbG9y
+          OwogCXByaXZhdGUgYm9vbCBfbWVtb1NoYWRvdzsKIAlwcml2YXRlIFRleHRQYXJzZVJlc3VsdCBf
+          bWVtb1Jlc3VsdDsKIAlwcml2YXRlIHN0YXRpYyByZWFkb25seSBIYXNoU2V0PGNoYXI+IFJlcG9y
+          dGVkTWlzc2luZyA9IG5ldygpOworCXByaXZhdGUgc3RhdGljIGJvb2wgVXNlc0xhdGluRm9udChj
+          aGFyIGNoKSA9PiAoY2ggPj0gJyAnICYmIGNoIDw9ICd+JykgfHwgY2ggaXMgJ+KAmCcgb3IgJ+KA
+          mScgb3IgJ+KAnCcgb3IgJ+KAnScgb3IgJ+KAlCcgb3IgJ+KAkycgb3IgJ+KApic7CisJLy8gRHlu
+          YVB1ZmYgaXMgYSB3aWRlLCByb3VuZCB0eXBlZmFjZS4gU2xpZ2h0IHNjYWxpbmcgZml0cyB0aGUg
+          ZXhpc3RpbmcgbGluZQorCS8vIGhlaWdodCBhbmQgcHJldmVudHMgY2xpcHBpbmcgaW5zaWRlIHRo
+          ZSBvcmlnaW5hbCBWTiBkaWFsb2d1ZSBmcmFtZS4KKwlwcml2YXRlIHN0YXRpYyBpbnQgTGF0aW5G
+          b250U2l6ZShpbnQgY2VsbFNpemUpID0+IE1hdGguTWF4KDEyLCBNYXRoZi5Sb3VuZFRvSW50KGNl
+          bGxTaXplICogMC44OWYpKTsKKwkvLyBRdWVyeSB0aGUgYWN0dWFsIGZvbnQgZm9yIGVhY2ggc3Vj
+          Y2Vzc2l2ZSBwcmVmaXggc28gYWR2YW5jZXMgcHJlc2VydmUKKwkvLyBrZXJuaW5nLCBpbnN0ZWFk
+          IG9mIHVzaW5nIGd1ZXNzZWQgZml4ZWQtd2lkdGggYml0bWFwIGNoYXJhY3RlciBjZWxscy4KKwlw
+          cml2YXRlIGZsb2F0IEdseXBoQWR2YW5jZShjaGFyIGNoLCBpbnQgc2l6ZSwgaW50IGxpbmVTcGFj
+          aW5nLCBzdHJpbmcgbGF0aW5SdW4gPSAiIikKKwl7CisJCWlmIChfbGF0aW5Gb250ICE9IG51bGwg
+          JiYgVXNlc0xhdGluRm9udChjaCkpCisJCXsKKwkJCWludCBwb2ludFNpemUgPSBMYXRpbkZvbnRT
+          aXplKHNpemUpOworCQkJZmxvYXQgYmVmb3JlID0gX2xhdGluRm9udC5HZXRTdHJpbmdTaXplKGxh
+          dGluUnVuLCBmb250U2l6ZTogcG9pbnRTaXplKS5YOworCQkJZmxvYXQgYWZ0ZXIgPSBfbGF0aW5G
+          b250LkdldFN0cmluZ1NpemUobGF0aW5SdW4gKyBjaCwgZm9udFNpemU6IHBvaW50U2l6ZSkuWDsK
+          KwkJCXJldHVybiBNYXRoLk1heCgxZiwgYWZ0ZXIgLSBiZWZvcmUgKyBsaW5lU3BhY2luZyk7CisJ
+          CX0KKwkJaWYgKGNoID4gMHg3ZikKKwkJCXJldHVybiBNYXRoLk1heCgxLCBzaXplICsgbGluZVNw
+          YWNpbmcpOworCQlmbG9hdCB3aWR0aCA9IGNoIHN3aXRjaAorCQl7CisJCQknICcgPT4gMC40MmYs
+          CisJCQknaScgb3IgJ2onIG9yICdsJyBvciAnSScgb3IgJyEnIG9yICcuJyBvciAnLCcgb3IgJzon
+          IG9yICc7JyBvciAnXCcnIG9yICdgJyBvciAnfCcgPT4gMC4zNGYsCisJCQknZicgb3IgJ3InIG9y
+          ICd0JyBvciAnKCcgb3IgJyknIG9yICdbJyBvciAnXScgb3IgJ3snIG9yICd9JyA9PiAwLjQ2ZiwK
+          KwkJCSdNJyBvciAnVycgb3IgJ0AnIG9yICclJyBvciAnJicgPT4gMC45MGYsCisJCQlfID0+IDAu
+          NjNmCisJCX07CisJCXJldHVybiBNYXRoLk1heCgxLCBNYXRoZi5Sb3VuZFRvSW50KHNpemUgKiB3
+          aWR0aCkgKyBsaW5lU3BhY2luZyk7CisJfQorCS8vIExvb2sgYWhlYWQgYXQgYW4gRW5nbGlzaCB3
+          b3JkIHNvIHdyYXBwaW5nIGhhcHBlbnMgYmVmb3JlIHRoZSB3b3JkLCByYXRoZXIKKwkvLyB0aGFu
+          IGN1dHRpbmcgaXQgaW4gaGFsZiBhdCB0aGUgcmlnaHQgZWRnZSBvZiB0aGUgZGlhbG9ndWUgcGFu
+          ZWwuCisJcHJpdmF0ZSBmbG9hdCBVcGNvbWluZ1dvcmRXaWR0aChzdHJpbmcgdGV4dCwgaW50IHN0
+          YXJ0LCBpbnQgc2l6ZSwgaW50IGxpbmVTcGFjaW5nKQorCXsKKwkJZmxvYXQgd2lkdGggPSAwOwor
+          CQlzdHJpbmcgbGF0aW5SdW4gPSAiIjsKKwkJZm9yIChpbnQgaSA9IHN0YXJ0OyBpIDwgdGV4dC5M
+          ZW5ndGg7IGkrKykKKwkJeworCQkJY2hhciBjaCA9IHRleHRbaV07CisJCQlpZiAoY2hhci5Jc1do
+          aXRlU3BhY2UoY2gpIHx8IGNoIGlzICc8JyBvciAnPicgb3IgJ1xcJyBvciAnfCcpCisJCQkJYnJl
+          YWs7CisJCQl3aWR0aCArPSBHbHlwaEFkdmFuY2UoY2gsIHNpemUsIGxpbmVTcGFjaW5nLCBsYXRp
+          blJ1bik7CisJCQlsYXRpblJ1biA9IFVzZXNMYXRpbkZvbnQoY2gpID8gbGF0aW5SdW4gKyBjaCA6
+          ICIiOworCQl9CisJCXJldHVybiB3aWR0aDsKKwl9CiAJcHVibGljIFRleHRQYXJzZVJlc3VsdCBV
+          cGRhdGUoaW50IHByb2dyZXNzKQogCXsKKwkJYm9vbCBlbmdsaXNoTGF5b3V0ID0gV2EyRW5naW5l
+          TWFpbi5FbmdpbmU/LkxhbmcgPT0gV2EyRW5naW5lTWFpbi5MYW5ndWFnZS5FTjsKIAkJaWYgKF9t
+          ZW1vVmFsaWQgJiYgUmVmZXJlbmNlRXF1YWxzKF9tZW1vVGV4dCwgVGV4dCkgJiYgX21lbW9Qcm9n
+          cmVzcyA9PSBwcm9ncmVzcyAmJiBfbWVtb1NlZ21lbnQgPT0gU2VnbWVudCAmJgogCQkJX21lbW9G
+          b250U2l6ZSA9PSBGb250U2l6ZSAmJiBfbWVtb01heENoYXJzID09IE1heENoYXJzICYmIF9tZW1v
+          TGluZVNwYWNpbmcgPT0gTGluZVNwYWNpbmcgJiYKLQkJCV9tZW1vUGFyYWdyYXBoU3BhY2luZyA9
+          PSBQYXJhZ3JhcGhTcGFjaW5nICYmIF9tZW1vQ29sb3IgPT0gQ29sb3IgJiYgX21lbW9TaGFkb3cg
+          PT0gU2hhZG93KQorCQkJX21lbW9QYXJhZ3JhcGhTcGFjaW5nID09IFBhcmFncmFwaFNwYWNpbmcg
+          JiYgX21lbW9Db2xvciA9PSBDb2xvciAmJiBfbWVtb1NoYWRvdyA9PSBTaGFkb3cgJiYKKwkJCV9t
+          ZW1vRW5nbGlzaExheW91dCA9PSBlbmdsaXNoTGF5b3V0KQogCQl7CiAJCQlyZXR1cm4gbmV3IFRl
+          eHRQYXJzZVJlc3VsdCB7IEVuZFBvc2l0aW9uID0gX21lbW9SZXN1bHQuRW5kUG9zaXRpb24sIFBh
+          cnNlRW5kID0gX21lbW9SZXN1bHQuUGFyc2VFbmQsIFdhaXRLZXkgPSBfbWVtb1Jlc3VsdC5XYWl0
+          S2V5IH07CiAJCX0KQEAgLTE0Miw2ICsxOTIsNyBAQCBwdWJsaWMgcGFydGlhbCBjbGFzcyBXYTJM
+          YWJlbCA6IE5vZGUyRAogCQlfbWVtb1BhcmFncmFwaFNwYWNpbmcgPSBQYXJhZ3JhcGhTcGFjaW5n
+          OwogCQlfbWVtb0NvbG9yID0gQ29sb3I7CiAJCV9tZW1vU2hhZG93ID0gU2hhZG93OworCQlfbWVt
+          b0VuZ2xpc2hMYXlvdXQgPSBlbmdsaXNoTGF5b3V0OwogCQlfbWVtb1Jlc3VsdCA9IG5ldyBUZXh0
+          UGFyc2VSZXN1bHQgeyBFbmRQb3NpdGlvbiA9IHBhcnNlZC5FbmRQb3NpdGlvbiwgUGFyc2VFbmQg
+          PSBwYXJzZWQuUGFyc2VFbmQsIFdhaXRLZXkgPSBwYXJzZWQuV2FpdEtleSB9OwogCQlRdWV1ZVJl
+          ZHJhdygpOwogCQlyZXR1cm4gcGFyc2VkOwpAQCAtMTU2LDkgKzIwNywxMyBAQCBwdWJsaWMgcGFy
+          dGlhbCBjbGFzcyBXYTJMYWJlbCA6IE5vZGUyRAogCQlpbnQgY3VyU2VnbWVudCA9IDA7CiAJCWlu
+          dCBtb2RGb250U2l6ZSA9IEZvbnRTaXplOwogCQlTdGFjazxUZXh0VGFnPiB0YWdMaXN0ID0gbmV3
+          KCk7Ci0JCWludCBkcmF3WCA9IDA7CisJCWZsb2F0IGRyYXdYID0gMDsKIAkJaW50IGRyYXdZID0g
+          MDsKLQkJaW50IGxhc3REcmF3WCA9IDA7CisJCWZsb2F0IGxhc3REcmF3WCA9IDA7CisJCWZsb2F0
+          IGxhc3RHbHlwaEFkdmFuY2UgPSBGb250U2l6ZTsKKwkJc3RyaW5nIGxhdGluUnVuID0gIiI7CisJ
+          CWJvb2wgZW5nbGlzaExheW91dCA9IFdhMkVuZ2luZU1haW4uRW5naW5lPy5MYW5nID09IFdhMkVu
+          Z2luZU1haW4uTGFuZ3VhZ2UuRU47CisJCWludCBtYXhMaW5lV2lkdGggPSAoTWF4Q2hhcnMgLSAx
+          KSAqIChGb250U2l6ZSArIExpbmVTcGFjaW5nKTsKIAkJVGV4dFBhcnNlUmVzdWx0IHIgPSBuZXco
+          KTsKIAkJLy8gaW50IGRyYXdYID0gMDsKIAkJLy8gaW50IGRyYXdZID0gMDsKQEAgLTI1OSw2ICsz
+          MTQsNyBAQCBwdWJsaWMgcGFydGlhbCBjbGFzcyBXYTJMYWJlbCA6IE5vZGUyRAogCQkJCQkJCQl0
+          YWcuVmFsdWUgPSBGb250U2l6ZTsKIAkJCQkJCQkJaSsrOwogCQkJCQkJCQltb2RGb250U2l6ZSA9
+          IFBhcnNlRGVjaW1hbERpZ2l0cyhUZXh0LCByZWYgaSk7CisJCQkJCQkJCWxhdGluUnVuID0gIiI7
+          CiAJCQkJCQkJCXRhZ0xpc3QuUHVzaCh0YWcpOwogCQkJCQkJCQlicmVhazsKIAkJCQkJCQljYXNl
+          ICdLJzoKQEAgLTI3MCw3ICszMjYsNyBAQCBwdWJsaWMgcGFydGlhbCBjbGFzcyBXYTJMYWJlbCA6
+          IE5vZGUyRAogCQkJCQkJCWNhc2UgJ3InOgogCQkJCQkJCQkvL+iusOW9leW9k+WJjee7mOWItuea
+          hOS9jee9ruaWueS+v+S4i+asoemBh+WIsHznrKblj7fml7bnu5jliLbms6jpn7PlrZfnrKYKIAkJ
+          CQkJCQkJdGFnLlR5cGUgPSA1OwotCQkJCQkJCQl0YWcuVmFsdWUgPSBkcmF3WDsKKwkJCQkJCQkJ
+          dGFnLlZhbHVlID0gTWF0aGYuUm91bmRUb0ludChkcmF3WCk7CiAJCQkJCQkJCXRhZ0xpc3QuUHVz
+          aCh0YWcpOwogCQkJCQkJCQlicmVhazsKIAkJCQkJCQljYXNlICdTJzoKQEAgLTM0MCw2ICszOTYs
+          NyBAQCBwdWJsaWMgcGFydGlhbCBjbGFzcyBXYTJMYWJlbCA6IE5vZGUyRAogCQkJCQkJCQlicmVh
+          azsKIAkJCQkJCQljYXNlIDQ6CiAJCQkJCQkJCW1vZEZvbnRTaXplID0gdGFnLlZhbHVlOworCQkJ
+          CQkJCQlsYXRpblJ1biA9ICIiOwogCQkJCQkJCQlicmVhazsKIAkJCQkJCQljYXNlIDY6CiAJCQkJ
+          CQkJCWJyZWFrOwpAQCAtNDMzLDExICs0OTAsMzYgQEAgcHVibGljIHBhcnRpYWwgY2xhc3MgV2Ey
+          TGFiZWwgOiBOb2RlMkQKIAkJCQkJCQljdXJTZWdtZW50Kys7CiAJCQkJCQkJYnJlYWs7CiAJCQkJ
+          CQljYXNlICduJzoKLQkJCQkJCQlsYXN0RHJhd1ggPSBkcmF3WDsKLQkJCQkJCQlpZiAoZHJhd1gg
+          PiAwKQorCQkJCQkJCS8vIEVuZ2xpc2ggcGF0Y2hlcyBvZnRlbiBjb250YWluIG1hbnVhbCBsaW5l
+          IGJyZWFrcyBpbnRlbmRlZCBmb3IKKwkJCQkJCQkvLyB0aGUgb3JpZ2luYWwgZml4ZWQtd2lkdGgg
+          SmFwYW5lc2UgdGV4dCBncmlkLiBUcmVhdCB0aGVzZSBhcworCQkJCQkJCS8vIHNwYWNlcyBhbmQg
+          bGV0IG91ciBwcm9wb3J0aW9uYWwgd29yZCB3cmFwcGVyIHJlZmxvdyB0aGUgbGluZS4KKwkJCQkJ
+          CQlpZiAoZW5nbGlzaExheW91dCkKKwkJCQkJCQl7CisJCQkJCQkJCWJvb2wgaGFzU3BhY2UgPSAo
+          aSA+PSAyICYmIFRleHRbaSAtIDJdID09ICcgJykgfHwKKwkJCQkJCQkJCShpICsgMSA8IFRleHQu
+          TGVuZ3RoICYmIFRleHRbaSArIDFdID09ICcgJyk7CisJCQkJCQkJCWlmIChkcmF3WCA+IDAgJiYg
+          IWhhc1NwYWNlKQorCQkJCQkJCQl7CisJCQkJCQkJCQlmbG9hdCBzcGFjZVdpZHRoID0gR2x5cGhB
+          ZHZhbmNlKCcgJywgbW9kRm9udFNpemUsIExpbmVTcGFjaW5nLCBsYXRpblJ1bik7CisJCQkJCQkJ
+          CQlmbG9hdCBuZXh0V29yZFdpZHRoID0gVXBjb21pbmdXb3JkV2lkdGgoVGV4dCwgaSArIDEsIG1v
+          ZEZvbnRTaXplLCBMaW5lU3BhY2luZyk7CisJCQkJCQkJCQlpZiAobmV4dFdvcmRXaWR0aCA8PSBt
+          YXhMaW5lV2lkdGggJiYgZHJhd1ggKyBzcGFjZVdpZHRoICsgbmV4dFdvcmRXaWR0aCA+IG1heExp
+          bmVXaWR0aCkKKwkJCQkJCQkJCXsKKwkJCQkJCQkJCQlkcmF3WSArPSBGb250U2l6ZSArIFBhcmFn
+          cmFwaFNwYWNpbmc7CisJCQkJCQkJCQkJZHJhd1ggPSAwOworCQkJCQkJCQkJCWxhdGluUnVuID0g
+          IiI7CisJCQkJCQkJCQl9CisJCQkJCQkJCQllbHNlCisJCQkJCQkJCQl7CisJCQkJCQkJCQkJZHJh
+          d1ggKz0gc3BhY2VXaWR0aDsKKwkJCQkJCQkJCQlsYXRpblJ1biArPSAiICI7CisJCQkJCQkJCQl9
+          CisJCQkJCQkJCX0KKwkJCQkJCQl9CisJCQkJCQkJZWxzZSBpZiAoZHJhd1ggPiAwKQogCQkJCQkJ
+          CXsKKwkJCQkJCQkJbGFzdERyYXdYID0gZHJhd1g7CiAJCQkJCQkJCWRyYXdZICs9IEZvbnRTaXpl
+          ICsgUGFyYWdyYXBoU3BhY2luZzsKIAkJCQkJCQkJZHJhd1ggPSAwOworCQkJCQkJCQlsYXRpblJ1
+          biA9ICIiOwogCQkJCQkJCX0KIAogCQkJCQkJCWJyZWFrOwpAQCAtNDc0LDYgKzU1NiwzMCBAQCBw
+          dWJsaWMgcGFydGlhbCBjbGFzcyBXYTJMYWJlbCA6IE5vZGUyRAogCQkJCWNhc2UgJ34nOgogCQkJ
+          CQlicmVhazsKIAkJCQlkZWZhdWx0OgorCQkJCQlmbG9hdCBnbHlwaEFkdmFuY2UgPSBHbHlwaEFk
+          dmFuY2UoVGV4dFtpXSwgbW9kRm9udFNpemUsIExpbmVTcGFjaW5nLCBsYXRpblJ1bik7CisJCQkJ
+          CS8vIEluIEVuZ2xpc2gsIHdyYXAgYWNjb3JkaW5nIHRvIHRoZSBhY3R1YWwgTGF0aW4gYWR2YW5j
+          ZSBpbnN0ZWFkCisJCQkJCS8vIG9mIGEgZml4ZWQgMjgtY2hhcmFjdGVyIGdyaWQsIHByZWZlcmFi
+          bHkgYXQgd29yZCBib3VuZGFyaWVzLgorCQkJCQlib29sIHN0YXJ0c1dvcmQgPSBUZXh0W2ldICE9
+          ICcgJyAmJgorCQkJCQkJKGkgPT0gMCB8fCBUZXh0W2kgLSAxXSA9PSAnICcgfHwKKwkJCQkJCSAo
+          aSA+PSAyICYmIFRleHRbaSAtIDJdID09ICdcXCcgJiYgVGV4dFtpIC0gMV0gPT0gJ24nKSk7CisJ
+          CQkJCWZsb2F0IHVwY29taW5nV2lkdGggPSBlbmdsaXNoTGF5b3V0ICYmIHN0YXJ0c1dvcmQKKwkJ
+          CQkJCT8gVXBjb21pbmdXb3JkV2lkdGgoVGV4dCwgaSwgbW9kRm9udFNpemUsIExpbmVTcGFjaW5n
+          KSA6IDA7CisJCQkJCWlmIChlbmdsaXNoTGF5b3V0ICYmIGRyYXdYID4gMCAmJgorCQkJCQkJKChz
+          dGFydHNXb3JkICYmIHVwY29taW5nV2lkdGggPD0gbWF4TGluZVdpZHRoICYmIGRyYXdYICsgdXBj
+          b21pbmdXaWR0aCA+IG1heExpbmVXaWR0aCkKKwkJCQkJCSB8fCBkcmF3WCArIGdseXBoQWR2YW5j
+          ZSA+IG1heExpbmVXaWR0aCkpCisJCQkJCXsKKwkJCQkJCWRyYXdZICs9IEZvbnRTaXplICsgUGFy
+          YWdyYXBoU3BhY2luZzsKKwkJCQkJCWRyYXdYID0gMDsKKwkJCQkJCWxhdGluUnVuID0gIiI7CisJ
+          CQkJCQlnbHlwaEFkdmFuY2UgPSBHbHlwaEFkdmFuY2UoVGV4dFtpXSwgbW9kRm9udFNpemUsIExp
+          bmVTcGFjaW5nKTsKKwkJCQkJfQorCQkJCQlmbG9hdCBnbHlwaFggPSBkcmF3WDsKKwkJCQkJaWYg
+          KF9sYXRpbkZvbnQgIT0gbnVsbCAmJiBVc2VzTGF0aW5Gb250KFRleHRbaV0pKQorCQkJCQl7CisJ
+          CQkJCQkvLyBTaGlmdCB0aGUgZ2x5cGgncyBvcmlnaW4gYnkgaXRzIGtlcm5pbmcgcGFpciBhZGp1
+          c3RtZW50LgorCQkJCQkJZmxvYXQgc2luZ2xlV2lkdGggPSBfbGF0aW5Gb250LkdldFN0cmluZ1Np
+          emUoVGV4dFtpXS5Ub1N0cmluZygpLCBmb250U2l6ZTogTGF0aW5Gb250U2l6ZShtb2RGb250U2l6
+          ZSkpLlg7CisJCQkJCQlnbHlwaFggKz0gZ2x5cGhBZHZhbmNlIC0gc2luZ2xlV2lkdGggLSBMaW5l
+          U3BhY2luZzsKKwkJCQkJfQogCQkJCQlpZiAoY3VyU2VnbWVudCA+PSBTZWdtZW50KQogCQkJCQl7
+          CiAJCQkJCQljdXJwcm9ncmVzcyArPSBTcGVlZCAvIDEwOwpAQCAtNDgyLDIxICs1ODgsMjQgQEAg
+          cHVibGljIHBhcnRpYWwgY2xhc3MgV2EyTGFiZWwgOiBOb2RlMkQKIAkJCQkJCXsKIAkJCQkJCQl2
+          ID0gcHJvZ3Jlc3MgLSBjdXJwcm9ncmVzczsKIAkJCQkJCX0KLQkJCQkJCV9yZW5kZXJEYXRhcy5B
+          ZGQobmV3IENoYXJSZW5kZXJEYXRhKFRleHRbaV0sIGRyYXdYLCBkcmF3WSwgbW9kRm9udFNpemUs
+          IHYpKTsKKwkJCQkJCV9yZW5kZXJEYXRhcy5BZGQobmV3IENoYXJSZW5kZXJEYXRhKFRleHRbaV0s
+          IGdseXBoWCwgZHJhd1ksIG1vZEZvbnRTaXplLCB2KSk7CiAJCQkJCX0KIAkJCQkJZWxzZQogCQkJ
+          CQl7Ci0JCQkJCQlfcmVuZGVyRGF0YXMuQWRkKG5ldyBDaGFyUmVuZGVyRGF0YShUZXh0W2ldLCBk
+          cmF3WCwgZHJhd1ksIG1vZEZvbnRTaXplLCAxNikpOworCQkJCQkJX3JlbmRlckRhdGFzLkFkZChu
+          ZXcgQ2hhclJlbmRlckRhdGEoVGV4dFtpXSwgZ2x5cGhYLCBkcmF3WSwgbW9kRm9udFNpemUsIDE2
+          KSk7CiAJCQkJCX0KIAkJCQkJbGFzdERyYXdYID0gZHJhd1g7Ci0JCQkJCWlmIChkcmF3WCA+PSAo
+          KE1heENoYXJzIC0gMSkgKiAoRm9udFNpemUgKyBMaW5lU3BhY2luZykpKQorCQkJCQlsYXN0R2x5
+          cGhBZHZhbmNlID0gZ2x5cGhBZHZhbmNlOworCQkJCQlsYXRpblJ1biA9IFVzZXNMYXRpbkZvbnQo
+          VGV4dFtpXSkgPyBsYXRpblJ1biArIFRleHRbaV0gOiAiIjsKKwkJCQkJaWYgKCFlbmdsaXNoTGF5
+          b3V0ICYmIGRyYXdYID49IG1heExpbmVXaWR0aCkKIAkJCQkJewogCQkJCQkJZHJhd1kgKz0gRm9u
+          dFNpemUgKyBQYXJhZ3JhcGhTcGFjaW5nOwogCQkJCQkJZHJhd1ggPSAwOworCQkJCQkJbGF0aW5S
+          dW4gPSAiIjsKIAkJCQkJfQogCQkJCQllbHNlCiAJCQkJCXsKLQkJCQkJCWRyYXdYICs9IG1vZEZv
+          bnRTaXplICsgTGluZVNwYWNpbmc7CisJCQkJCQlkcmF3WCArPSBnbHlwaEFkdmFuY2U7CiAJCQkJ
+          CX0KIAkJCQkJYnJlYWs7CiAJCQl9CkBAIC01MDksNyArNjE4LDcgQEAgcHVibGljIHBhcnRpYWwg
+          Y2xhc3MgV2EyTGFiZWwgOiBOb2RlMkQKIAkJfQogCQllbHNlCiAJCXsKLQkJCXIuRW5kUG9zaXRp
+          b24gPSBuZXcgVmVjdG9yMihsYXN0RHJhd1ggKyBGb250U2l6ZSwgZHJhd1kgLSBGb250U2l6ZSAt
+          IFBhcmFncmFwaFNwYWNpbmcpOworCQkJci5FbmRQb3NpdGlvbiA9IG5ldyBWZWN0b3IyKGxhc3RE
+          cmF3WCArIChlbmdsaXNoTGF5b3V0ID8gbGFzdEdseXBoQWR2YW5jZSA6IEZvbnRTaXplKSwgZHJh
+          d1kgLSBGb250U2l6ZSAtIFBhcmFncmFwaFNwYWNpbmcpOwogCiAJCX0KIApAQCAtNTMyLDYgKzY0
+          MSwyMiBAQCBwdWJsaWMgcGFydGlhbCBjbGFzcyBXYTJMYWJlbCA6IE5vZGUyRAogCX0KIAlwdWJs
+          aWMgdm9pZCBEcmF3Q2hhcihDaGFyUmVuZGVyRGF0YSByLCBib29sIHNoYWRvd1Bhc3MpCiAJewor
+          CQlpZiAoX2xhdGluRm9udCAhPSBudWxsICYmIFVzZXNMYXRpbkZvbnQoci5DaHIpKQorCQl7CisJ
+          CQkvLyBUaGUgYXRsYXMgaXMgdG9wLWFsaWduZWQ7IEdvZG90J3MgZm9udCByZW5kZXJlciB1c2Vz
+          IGEgYmFzZWxpbmUuCisJCQkvLyBDZW50ZXIgdGhlIG5ldyBmb250IHZlcnRpY2FsbHkgaW5zaWRl
+          IHRoZSBvcmlnaW5hbCAyOHB4IGNlbGwuCisJCQlpbnQgcG9pbnRTaXplID0gTGF0aW5Gb250U2l6
+          ZShyLlNpemUpOworCQkJZmxvYXQgYmFzZWxpbmUgPSByLlkgKyAoci5TaXplIC0gX2xhdGluRm9u
+          dC5HZXRIZWlnaHQocG9pbnRTaXplKSkgKiAwLjVmICsgX2xhdGluRm9udC5HZXRBc2NlbnQocG9p
+          bnRTaXplKTsKKwkJCVZlY3RvcjIgb3JpZ2luID0gbmV3KHIuWCwgYmFzZWxpbmUpOworCQkJc3Ry
+          aW5nIGdseXBoID0gci5DaHIuVG9TdHJpbmcoKTsKKwkJCWlmIChzaGFkb3dQYXNzKQorCQkJCURy
+          YXdTdHJpbmdPdXRsaW5lKF9sYXRpbkZvbnQsIG9yaWdpbiwgZ2x5cGgsIEhvcml6b250YWxBbGln
+          bm1lbnQuTGVmdCwgLTEsIHBvaW50U2l6ZSwgMiwKKwkJCQkJbmV3IENvbG9yKDAuMDhmLCAwLjA4
+          ZiwgMC4wOGYsIHIuQWxwaGEgKiBTaGFkb3dDb2xvci5BKSk7CisJCQllbHNlCisJCQkJRHJhd1N0
+          cmluZyhfbGF0aW5Gb250LCBvcmlnaW4sIGdseXBoLCBIb3Jpem9udGFsQWxpZ25tZW50LkxlZnQs
+          IC0xLCBwb2ludFNpemUsCisJCQkJCW5ldyBDb2xvcihDb2xvci5SLCBDb2xvci5HLCBDb2xvci5C
+          LCByLkFscGhhKSk7CisJCQlyZXR1cm47CisJCX0KIAkJaWYgKCFXYTJEZWYuRm9udE1hcC5UcnlH
+          ZXRWYWx1ZShyLkNociwgb3V0IGludCBwb3MpKQogCQl7CiAJCQlpZiAoIXNoYWRvd1Bhc3MgJiYg
+          UmVwb3J0ZWRNaXNzaW5nLkFkZChyLkNocikpCkBAIC01NjMsNCArNjg4LDQgQEAgcHVibGljIHBh
+          cnRpYWwgY2xhc3MgV2EyTGFiZWwgOiBOb2RlMkQKIAkJVGV4dCA9IHRleHQ7CiAJCXJldHVybiBV
+          cGRhdGUocHJvZ3Jlc3MpOwogCX0KLX0KXCBObyBuZXdsaW5lIGF0IGVuZCBvZiBmaWxlCit9Cg==
+          WA2_PATCH_B64
           git diff --check
 
       - name: Bundle DynaPuff font and open-font license
@@ -367,3 +274,4 @@ jobs:
           name: WA2-Readable-iPhone-iPad-Unsigned
           path: build/WA2-iPhone-iPad-Readable.ipa
           if-no-files-found: error
+          
